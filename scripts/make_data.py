@@ -6,6 +6,7 @@
 Writes (all git-ignored):
   data/raw/drivers.csv                     driver master data
   data/raw/trips_<date>.csv                one file per day (default 1 day, 48,200 trips)
+  data/raw/payments_<date>.csv             payment settlements per day, linked to trips
   data/raw/gps/sample.ndjson               GPS pings, newline-delimited JSON, in arrival order
   data/fixtures/dirty_batch_*.parquet      silver-shaped candidate batches with injected faults
   data/fixtures/late_trip.csv              one trip that arrives two days late (raw schema)
@@ -17,7 +18,6 @@ import csv
 import json
 import math
 import random
-import string
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -32,8 +32,29 @@ CITIES = {  # name: (weight, centre lat, centre lon)
 }
 VEHICLES = ["economy", "economy", "economy", "comfort", "comfort", "xl"]
 PAYMENTS = ["card", "card", "cash", "wallet"]
-RAW_TRIP_COLUMNS = ["trip_id", "driver_id", "rider_id", "city", "start_ts", "end_ts", "distance_km",
-                    "fare_sar", "status", "surge_multiplier", "payment_method", "dropoff_geohash"]
+RAW_TRIP_COLUMNS = [
+    "trip_id",
+    "driver_id",
+    "rider_id",
+    "city",
+    "start_ts",
+    "end_ts",
+    "distance_km",
+    "fare_sar",
+    "status",
+    "surge_multiplier",
+    "payment_method",
+    "dropoff_geohash",
+]
+PAYMENT_COLUMNS = [
+    "payment_id",
+    "trip_id",
+    "rider_id",
+    "payment_method",
+    "amount_sar",
+    "payment_status",
+    "settled_ts",
+]
 TS = "%Y-%m-%d %H:%M:%S"
 # trips per hour of day, relative (morning and evening peaks)
 HOUR_W = [1, 1, 1, 1, 1, 2, 4, 7, 8, 6, 5, 5, 6, 6, 5, 5, 6, 8, 9, 9, 8, 6, 4, 2]
@@ -51,9 +72,12 @@ def pick_city(rng):
 def make_drivers(rng, n):
     rows = []
     for i in range(1, n + 1):
-        rows.append({"driver_id": f"D-{i:04d}", "vehicle_type": rng.choice(VEHICLES),
-                     "driver_rating": round(min(5.0, max(3.5, rng.gauss(4.7, 0.25))), 2),
-                     "city": pick_city(rng)})
+        rows.append({
+            "driver_id": f"D-{i:04d}",
+            "vehicle_type": rng.choice(VEHICLES),
+            "driver_rating": round(min(5.0, max(3.5, rng.gauss(4.7, 0.25))), 2),
+            "city": pick_city(rng),
+        })
     return rows
 
 
@@ -93,6 +117,51 @@ def make_trips(rng, day, n, drivers, start_index, riders=20000):
     return rows
 
 
+def make_payments(rng, trips, start_index, null_rate=0.015):
+    rows = []
+    for idx, t in enumerate(trips):
+        start = datetime.strptime(t["start_ts"], TS)
+        method = t["payment_method"]
+        fare = float(t["fare_sar"])
+
+        if t["status"] == "cancelled":
+            status = rng.choices(["refunded", "failed"], weights=[75, 25])[0]
+            amount = 0.0 if status == "failed" else round(fare, 2)
+            settled_ts = ""
+        elif method == "cash":
+            status = "settled"
+            amount = round(fare, 2)
+            settled_ts = (start + timedelta(minutes=rng.randint(5, 35))).strftime(TS)
+        else:
+            status = rng.choices(["settled", "pending", "failed"], weights=[93, 4, 3])[0]
+            amount = round(fare, 2) if status != "failed" else 0.0
+            settled_ts = (
+                (start + timedelta(minutes=rng.randint(1, 120))).strftime(TS)
+                if status == "settled"
+                else ""
+            )
+
+        if rng.random() < null_rate:
+            amount = ""
+        if rng.random() < null_rate * 0.5:
+            method = ""
+        if rng.random() < null_rate * 0.5:
+            status = ""
+        if settled_ts and rng.random() < null_rate:
+            settled_ts = ""
+
+        rows.append({
+            "payment_id": f"P-{start_index + idx:06d}",
+            "trip_id": t["trip_id"],
+            "rider_id": t["rider_id"],
+            "payment_method": method,
+            "amount_sar": amount,
+            "payment_status": status,
+            "settled_ts": settled_ts,
+        })
+    return rows
+
+
 def write_csv(path, rows, columns):
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", newline="", encoding="utf-8") as f:
@@ -115,15 +184,21 @@ def make_pings(rng, trips, n_trips=1000, per_trip=120, step_s=10, late_share=0.0
             lon += rng.gauss(0, 0.0007)
             ev = start + timedelta(seconds=i * step_s)
             emit = ev + timedelta(seconds=late_s if rng.random() < late_share else 0)
-            events.append((emit, {"trip_id": t["trip_id"], "driver_id": t["driver_id"], "city": t["city"],
-                                  "lat": round(lat, 6), "lon": round(lon, 6),
-                                  "event_ts": ev.strftime("%Y-%m-%dT%H:%M:%SZ")}))
+            events.append((emit, {
+                "trip_id": t["trip_id"],
+                "driver_id": t["driver_id"],
+                "city": t["city"],
+                "lat": round(lat, 6),
+                "lon": round(lon, 6),
+                "event_ts": ev.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            }))
     events.sort(key=lambda e: e[0])
     return [e[1] for e in events]
 
 
 def write_fixtures(rng, trips, day, out):
     import pandas as pd  # only needed for parquet fixtures
+
     fx = out / "fixtures"
     fx.mkdir(parents=True, exist_ok=True)
 
@@ -133,11 +208,19 @@ def write_fixtures(rng, trips, day, out):
             if t["status"] != "completed":
                 continue
             s, e = datetime.strptime(t["start_ts"], TS), datetime.strptime(t["end_ts"], TS)
-            recs.append({"trip_id": t["trip_id"], "driver_id": t["driver_id"], "rider_id": t["rider_id"],
-                         "city": t["city"], "started_at": s, "ended_at": e,
-                         "distance_km": float(t["distance_km"]), "fare_sar": float(t["fare_sar"]),
-                         "duration_min": (e - s).total_seconds() / 60.0, "status": t["status"],
-                         "surge_multiplier": float(t["surge_multiplier"])})
+            recs.append({
+                "trip_id": t["trip_id"],
+                "driver_id": t["driver_id"],
+                "rider_id": t["rider_id"],
+                "city": t["city"],
+                "started_at": s,
+                "ended_at": e,
+                "distance_km": float(t["distance_km"]),
+                "fare_sar": float(t["fare_sar"]),
+                "duration_min": (e - s).total_seconds() / 60.0,
+                "status": t["status"],
+                "surge_multiplier": float(t["surge_multiplier"]),
+            })
         return pd.DataFrame(recs)
 
     base = silver_like(trips)
@@ -154,10 +237,20 @@ def write_fixtures(rng, trips, day, out):
 
     # one trip that arrives two days after it happened (lookback drill)
     late_start = day - timedelta(days=2) + timedelta(hours=10, minutes=15)
-    late = {"trip_id": "T-900001", "driver_id": "D-0001", "rider_id": "rider_00042", "city": "Riyadh",
-            "start_ts": late_start.strftime(TS), "end_ts": (late_start + timedelta(minutes=22)).strftime(TS),
-            "distance_km": 11.4, "fare_sar": 58.5, "status": "completed", "surge_multiplier": 1.0,
-            "payment_method": "card", "dropoff_geohash": "7zabcd"}
+    late = {
+        "trip_id": "T-900001",
+        "driver_id": "D-0001",
+        "rider_id": "rider_00042",
+        "city": "Riyadh",
+        "start_ts": late_start.strftime(TS),
+        "end_ts": (late_start + timedelta(minutes=22)).strftime(TS),
+        "distance_km": 11.4,
+        "fare_sar": 58.5,
+        "status": "completed",
+        "surge_multiplier": 1.0,
+        "payment_method": "card",
+        "dropoff_geohash": "7zabcd",
+    }
     write_csv(fx / "late_trip.csv", [late], RAW_TRIP_COLUMNS)
 
     done = [t for t in trips if t["status"] == "completed"]
@@ -186,7 +279,7 @@ def main():
     write_csv(out / "raw" / "drivers.csv", drivers, ["driver_id", "vehicle_type", "driver_rating", "city"])
     print(f"wrote {rel(out / 'raw' / 'drivers.csv')}  {len(drivers):>9,} rows")
 
-    all_trips, nxt = [], 1
+    all_trips, nxt, pay_nxt = [], 1, 1
     for d in range(a.days):
         day = first + timedelta(days=d)
         rows = make_trips(rng, day, a.trips, drivers, nxt)
@@ -200,6 +293,12 @@ def main():
             all_trips = rows
         write_csv(p, rows, RAW_TRIP_COLUMNS)
         print(f"wrote {rel(p)}  {len(rows):>9,} rows")
+
+        pay_rows = make_payments(rng, rows, pay_nxt)
+        pay_nxt += len(pay_rows)
+        pay_path = out / "raw" / f"payments_{day.strftime('%Y-%m-%d')}.csv"
+        write_csv(pay_path, pay_rows, PAYMENT_COLUMNS)
+        print(f"wrote {rel(pay_path)}  {len(pay_rows):>9,} rows")
 
     pings = make_pings(rng, all_trips)
     gp = out / "raw" / "gps" / "sample.ndjson"
